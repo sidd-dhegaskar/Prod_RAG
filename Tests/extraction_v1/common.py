@@ -73,7 +73,7 @@ ALLOWED_FORMATS = [
 # instead of writing a custom OCR backend wrapper.
 
 
-def build_converter(force_full_page_ocr: bool = True) -> DocumentConverter:
+def build_converter(force_full_page_ocr: bool = True, generate_picture_images: bool = False) -> DocumentConverter:
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = True
     pipeline_options.do_table_structure = True
@@ -89,6 +89,10 @@ def build_converter(force_full_page_ocr: bool = True) -> DocumentConverter:
     # trading some redundant work on already-correct native text for
     # completeness on picture-embedded text.
     pipeline_options.ocr_options = RapidOcrOptions(force_full_page_ocr=force_full_page_ocr)
+    # Needed to get cropped PIL images per picture via PictureItem.get_image(doc)
+    # — off by default since it's extra memory/IO not needed for text extraction.
+    pipeline_options.generate_picture_images = generate_picture_images
+    pipeline_options.images_scale = 2.0
 
     return DocumentConverter(
         allowed_formats=ALLOWED_FORMATS,

@@ -10,6 +10,8 @@ Eight production layers, a specific open-source tool for each, and the build ord
 - **Redis** backs both the semantic cache and the event queue — one piece of infra, two jobs.
 - **LangGraph** owns every orchestration step (query rewrite, retrieval, rerank, context assembly, generation) as explicit nodes — the graph *is* the pipeline diagram below, not a wrapper around it.
 
+**Deliberate exception to the self-hosted stack:** picture/chart extraction during ingestion (Layer 1) calls the **Gemini API** (hosted, not self-hosted) for the minority of pictures flagged by a cheap local triage step. See `Documents/EXTRACTION_APPROACH.md` for the full rationale — in short, OCR structurally cannot read symbolic/iconographic content (icons, arrows used in place of numbers), and validated testing showed no self-hosted OCR or layout engine closes that gap. This is a scoped, conscious deviation for one narrow sub-step, not a reversal of the self-hosted default elsewhere in the stack.
+
 ## 1. The pipeline
 
 ```mermaid
