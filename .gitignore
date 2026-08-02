@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+Tests/extraction_v1/samples/*
+!Tests/extraction_v1/samples/.gitkeep
+Tests/extraction_v1/output/
