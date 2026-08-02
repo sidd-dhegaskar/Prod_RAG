@@ -49,7 +49,7 @@ def save_document_content(doc, stem: str) -> dict:
     md_path = CONTENT_DIR / f"{stem}.md"
     json_path = CONTENT_DIR / f"{stem}.json"
 
-    md_path.write_text(doc.export_to_markdown(), encoding="utf-8")
+    md_path.write_text(doc.export_to_markdown(traverse_pictures=True), encoding="utf-8")
     json_path.write_text(json.dumps(doc.export_to_dict(), indent=2), encoding="utf-8")
 
     return {"markdown": md_path, "json": json_path}
@@ -73,7 +73,7 @@ ALLOWED_FORMATS = [
 # instead of writing a custom OCR backend wrapper.
 
 
-def build_converter(force_full_page_ocr: bool = False) -> DocumentConverter:
+def build_converter(force_full_page_ocr: bool = True) -> DocumentConverter:
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = True
     pipeline_options.do_table_structure = True
@@ -81,12 +81,13 @@ def build_converter(force_full_page_ocr: bool = False) -> DocumentConverter:
         mode=TableFormerMode.ACCURATE,
         do_cell_matching=True,
     )
-    # Default (False): Docling only OCRs pages with no digital text layer,
-    # so text baked into a picture/graphic on an otherwise digital-native
-    # page is never OCR'd — see EXTRACTION_APPROACH.md picture-OCR gap.
-    # True: OCRs every page as a full image regardless of existing text
-    # layer — catches picture-embedded text, at the cost of re-OCRing
-    # already-correct native text and being slower.
+    # Default True: Docling's page-level OCR skip (only OCR pages with no
+    # digital text layer) starves text baked into pictures/graphics on
+    # otherwise digital-native pages — confirmed via 06_compare_full_page_ocr.py
+    # to drop category labels a shallow pass misses (low-contrast/reverse
+    # text). force_full_page_ocr=True re-OCRs every page as a full image,
+    # trading some redundant work on already-correct native text for
+    # completeness on picture-embedded text.
     pipeline_options.ocr_options = RapidOcrOptions(force_full_page_ocr=force_full_page_ocr)
 
     return DocumentConverter(
