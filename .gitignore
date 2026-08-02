@@ -5,3 +5,7 @@ __pycache__/
 Tests/extraction_v1/samples/*
 !Tests/extraction_v1/samples/.gitkeep
 Tests/extraction_v1/output/
+
+extraction_pipeline/samples/*
+!extraction_pipeline/samples/.gitkeep
+extraction_pipeline/output/
