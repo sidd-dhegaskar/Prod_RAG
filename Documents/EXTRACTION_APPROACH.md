@@ -65,7 +65,7 @@ This section defines what extraction hands off to the next steps in Layer 1 (ACL
 | Reading order / sequence index | Keeps reassembly and citation-to-location correct |
 | Heading hierarchy / section path | Required input for the structure-aware chunking already committed to in the main design doc's Layer 1 — the chunker needs sections to chunk *by* |
 | Table payload | Both `export_to_html()` and `export_to_dataframe()` attached to the table element itself, not merged into surrounding prose text |
-| Extraction method / provenance (picture elements only) | **Not yet implemented** — planned per Section 9: tags picture-derived content as `ocr` vs. `gemini`-extracted, plus a link back to the stored picture crop. Required before Section 9's Gemini path can hand off usable, auditable results downstream; not required for text/table elements, which are OCR/TableFormer-derived by construction. |
+| Extraction method / provenance (picture elements only) | Carried natively by Docling's own schema — `created_by` and `confidence` on `BasePrediction` (the base class of `PictureMeta`'s sub-fields). No custom field needed; see Section 9.3. |
 
 **Format-uniformity check:** `run_with_formats` uses a different backend per input type (PDF → `StandardPdfPipeline`, DOCX → `SimplePipeline`, etc.), but all should converge on the same `DoclingDocument` schema. Verify this directly during testing — convert one sample PDF and one sample DOCX and diff their element structure (types, metadata fields present) rather than assuming uniformity holds across backends.
 
@@ -86,43 +86,144 @@ An alternative, evaluated but not yet adopted: reconstruct table structure direc
 
 **Status:** not implemented. Treat as the fallback to reach for if Step 4 (structural correctness check) shows TableFormer failing specifically on scanned dense-form pages. Do not implement pre-emptively — validate TableFormer's actual failure rate on real scanned samples first (Section 4's open question on scanned-vs-digital split needs an answer before this is worth building).
 
-## 9. Picture triage + Gemini extraction (decided direction, not yet built)
+## 9. Picture pipeline: classifier-gated triage + Gemini extraction
 
 ### 9.1 The problem this addresses
 
 Two distinct failure classes were found via manual inspection (`08_visualize_extraction.py`) on pictures Docling/RapidOCR extract text from:
 
-- **Reading order on multi-panel pictures** — OCR reads glyphs correctly but in the wrong sequence when a picture contains multiple independent panels (e.g. a 2×2 grid of charts). A hand-rolled nearest-anchor heuristic (`panel_reconstruction.py`) fixed the simple 2-panel case but broke on a genuine 2×2 grid.
-- **Symbolic/iconographic content** — icons (e.g. up-arrow/dash/"n.a." used in place of numeric values) are not in any OCR engine's character set. This is data loss, not misordering: PaddleOCR/PP-StructureV3 was evaluated specifically as a stronger reading-order engine (see below) and confirmed to *fix* the first problem but have *no effect* on the second — different failure class, no amount of better OCR/layout modeling closes it.
+- **Reading order on multi-panel pictures** — OCR reads glyphs correctly but in the wrong sequence when a picture contains multiple independent panels (e.g. a 2×2 grid of charts). A hand-rolled nearest-anchor heuristic (`panel_reconstruction.py`) fixed the simple 2-panel case but broke on a genuine 2×2 grid. **Explicitly out of scope for this pipeline** — see 9.7.
+- **Symbolic/iconographic content** — icons (e.g. up-arrow/dash/"n.a." used in place of numeric values) are not in any OCR engine's character set. This is data loss, not misordering. Confirmed on two separate OCR-family engines (RapidOCR, and PaddleOCR's PP-StructureV3 pipeline — see 9.2): both extract 0 of ~42 icon-coded data cells on the same sample table. **This is the problem this pipeline solves.**
 
-### 9.2 PaddleOCR / PP-StructureV3 evaluation — result
+### 9.2 Prior evaluation (context, not part of the build)
 
-Tested head-to-head against `panel_reconstruction.py` on the two hardest pictures in `samples/022-article-A002-en.pdf`:
+PaddleOCR/PP-StructureV3 was evaluated as a stronger reading-order engine and confirmed to fix the multi-panel case but have zero effect on the icon case — different failure class, no amount of better OCR/layout modeling closes it. **Decision: not adopted.** Docling remains the extraction framework (format breadth, TableFormer, the `DoclingDocument` schema in Section 6 all depend on it). Reference only: `Tests/extraction_v1/09_visualize_ppstructure.py` and `output/visualizations/*-ppstructure-compare.png`.
 
-- **2×2 chart grid (page 3):** PP-StructureV3 correctly separated all 4 panels with no cross-panel bleed, and correctly typed two panels as `table` (with rowspan/colspan HTML) and two as `chart`/`image`. Confirmed a real win over the heuristic.
-- **Icon table (page 4):** PP-StructureV3 recovered table structure (headers, most country names) but **every icon/symbol data cell came back empty** — same outcome as RapidOCR. Confirms the icon-recognition gap is orthogonal to which OCR/layout engine is used.
-- **Table-structure quality caveat:** on the same samples, PP-StructureV3's table output was not clearly better than Docling's TableFormer — one table lost a data row (Argentina) entirely, and another had a long tail of spurious empty rows. Not validated as a TableFormer replacement.
+Unstructured.io was also considered as a full parser swap and rejected on the same grounds: it is the same category of tool (OCR-backed parser), so it does not solve the icon-recognition gap either, and swapping would cost the `DoclingDocument` schema and format breadth for no gain.
 
-**Decision: not adopted as a pipeline swap.** Docling stays the extraction framework (format breadth, TableFormer, the `DoclingDocument` output contract in Section 6 all depend on it). See `Tests/extraction_v1/09_visualize_ppstructure.py` for the comparison script and `output/visualizations/*-ppstructure-compare.png` for the visual evidence, kept for reference if this is revisited.
+### 9.3 Architecture
 
-### 9.3 Chosen direction: classifier-gated triage, Gemini for extraction
+```
+DocumentConverter.convert()                         [Docling + RapidOCR, existing config — Sections 2-3]
+        │
+        ├─ text, headings, lists, native tables ──────────────────────────► unchanged, already working
+        │
+        └─ doc.pictures: list[PictureItem]
+                │  each has .meta.classification (Docling's own classifier, in-process, already run)
+                ▼
+        route_picture(picture) -> bool                [pure Python, no new dependency]
+                │
+        ┌───────┴────────┐
+        │                │
+    not flagged      flagged
+        │                │
+        │           picture.get_image(doc) -> PIL.Image
+        │                │
+        │           call_gemini(image) -> structured JSON result
+        │                │
+        │           write result onto picture.meta (.description or .tabular_chart)
+        │                │
+        └───────┬────────┘
+                ▼
+        doc.export_to_dict()                          [Section 6 output contract — unchanged shape]
+```
 
-Rather than routing all pictures through a VLM (rejected earlier — cost/latency/hallucination risk at corpus scale for content OCR already handles correctly), or building a custom confidence-signal detector from scratch, the chosen approach reuses one piece of Docling's native picture-handling stack and pairs it with an external call for the actual extraction:
+One Docling conversion pass produces the whole document, including picture crops and classification — no second parsing pass. Only flagged pictures make an external call. Everything else in the document is untouched by this pipeline.
 
-1. **Triage — Docling's built-in picture classifier** (`do_picture_classification=True`, `DocumentPictureClassifierOptions`). Small, in-process, HF-Transformers-based image classifier — not a VLM. Tags each picture by type (photo, diagram, chart, logo, etc.) with a confidence score, at negligible cost. This is the routing signal: pictures classified as chart/diagram/table-like (as opposed to e.g. decorative photos/logos) are candidates for escalation.
-2. **Extraction — Gemini API**, called directly from custom orchestration code for flagged pictures only, **not** via Docling's own `do_picture_description`/`do_chart_extraction` stages. Bypassing Docling's built-in description stage avoids standing up a local OpenAI-compatible server just to make a call Docling would make anyway, and keeps the extraction call (prompt, output format, provenance tagging) fully under direct control.
+### 9.4 Stage 1 — Triage (in-process, no new dependency)
 
-**Deliberate architecture exception:** Gemini is a hosted API, not self-hosted — this is a conscious, scoped deviation from `RAG_SYSTEM_DESIGN.md`'s self-hosted-stack default, limited to this one sub-step (flagged pictures only, not the general LLM/embedding/reranking path). Recorded in `RAG_SYSTEM_DESIGN.md`'s consistency-choices section.
+Docling's built-in picture classifier does this for free as part of the existing `convert()` call:
 
-### 9.4 How this resolves 9.1
+```python
+pipeline_options.do_picture_classification = True
+pipeline_options.generate_picture_images = True   # required for picture.get_image(doc) later
+pipeline_options.do_picture_description = False    # bypassed — Section 9.6 explains why
+pipeline_options.do_chart_extraction = False        # bypassed — same reason
+```
 
-- **Symbolic/iconographic content** (the primary target): resolved by design, not yet by implementation. Every picture the classifier flags as chart/diagram/table-like gets routed to Gemini instead of relying on OCR, so icon-coded data (the page-4 case: 0/42 cells recovered by either RapidOCR or PP-StructureV3) is no longer dependent on a character-set match at all — Gemini reads the image directly. This closes the gap structurally: the previous approaches all failed for the same underlying reason (OCR-family engines, regardless of which one), and this direction is the first one that isn't OCR-family.
-- **Reading order on multi-panel pictures**: explicitly **not** addressed by this direction — see 9.5. A capable VLM reading a picture as a whole image (rather than a sequence of OCR line-boxes) plausibly sidesteps the reading-order problem as a side effect, since it never had Docling's line-by-line ordering step to begin with — but this has not been tested and is not the reason this path was chosen, so treat it as an unconfirmed possible bonus, not a claimed fix.
-- **Cost/latency, kept bounded:** because the classifier gates which pictures reach Gemini, the majority case (clean digital text and tables, already handled correctly by Docling/TableFormer/RapidOCR) never touches the hosted API — only the minority flagged as picture-like content does. This is what keeps the design consistent with the "simpler, not accounting for every scenario OCR struggles with" preference: the pipeline doesn't grow a special case for every failure found by inspection, it grows one routing decision (classify → escalate) that any future failure class can plug into.
+Each `PictureItem` then carries `picture.meta.classification: PictureClassificationMetaField`, with `predictions: list[PictureClassificationPrediction(class_name, confidence, created_by)]`. The label set is Docling's own taxonomy (`docling_core.types.doc.labels.PictureClassificationLabel`) — confirmed to include, among others: `bar_chart`, `line_chart`, `pie_chart`, `scatter_plot`, `box_plot`, `heatmap`, `flow_chart`, `table`, `icon`, `logo`, `photograph`, `qr_code`, `bar_code`, `signature`, `stamp`, `screenshot`, `other`.
 
-### 9.5 Open, undecided as of this writing
+Routing is a plain function over that prediction list:
 
-- **Classification confidence threshold / allow-deny list** for what counts as "flagged" — `classification_min_confidence`, `classification_allow`/`deny` on `PictureDescriptionBaseOptions` exist and can gate this, but no threshold has been chosen or tested.
-- **Gemini prompt/output contract** — free-text description vs. constrained/structured output (e.g. forcing a closed label set for icon legends). Free text carries more hallucination risk; not yet decided.
-- **Provenance metadata** — flagged as a planned field in Section 6's output contract table but not yet implemented: the exact schema (method tag values, link format back to the stored picture crop) still needs to be designed.
-- **Multi-panel reading order is not addressed by this direction** (see 9.4) — the Gemini-extraction path targets symbolic content; multi-panel reading order remains an accepted, undecided-on gap unless revisited separately.
+```python
+def needs_gemini_extraction(picture: PictureItem, flag_labels: set[str], min_confidence: float) -> bool:
+    classification = picture.meta.classification if picture.meta else None
+    if not classification or not classification.predictions:
+        return True  # no classifier signal — fail open, don't silently skip a picture
+    top = max(classification.predictions, key=lambda p: p.confidence)
+    return top.class_name in flag_labels and top.confidence >= min_confidence
+```
+
+**To decide before/while building** (see 9.7): which labels go in `flag_labels` (charts/tables/icons clearly yes; photograph/logo/signature/qr_code clearly no — a handful of labels are genuinely ambiguous and need a real sample to judge), and where `min_confidence` sits. Start with a permissive threshold (fail toward escalating, not toward silent OCR-only fallback) and tighten using real corpus data once available — do not hand-tune against the two known sample PDFs alone, per Section 4's open question on corpus composition.
+
+### 9.5 Stage 2 — Extraction call (Gemini, external)
+
+For each flagged `PictureItem`:
+
+```python
+image: PIL.Image.Image = picture.get_image(doc)   # already-cropped picture, confirmed working in 08_/09_ scripts
+```
+
+Send `image` to the Gemini API with **structured output** (`response_schema`), not a free-text captioning prompt — this is the concrete resolution of the hallucination-risk concern raised earlier: constrain the model to a closed shape instead of letting it narrate. Draft schema (to be refined against real samples, not finalized here):
+
+```python
+{
+  "type": "object",
+  "properties": {
+    "content_type": {"type": "string", "enum": ["table", "chart", "icon_legend_table", "other"]},
+    "title": {"type": "string"},
+    "extracted_text": {"type": "string"},        # used when content_type == "other"
+    "table_rows": {                                # used when content_type in {"table", "icon_legend_table"}
+      "type": "array",
+      "items": {"type": "array", "items": {"type": "string"}}
+    },
+    "notes": {"type": "string"}                    # model's own caveats — informational only, not a trust signal
+  },
+  "required": ["content_type"]
+}
+```
+
+**To decide before building:** exact schema shape (the draft above is a starting point, not final — needs testing against the page-3 chart panels and page-4 icon table specifically), the prompt text, which Gemini model/API version, and how the SDK call itself is structured (`google-genai` package — not yet installed or tested in this repo; confirm the current SDK name/import path when building, since Google's Python SDK naming has changed across versions).
+
+### 9.6 Stage 3 — Writing the result back (Docling's native schema, no custom types)
+
+`PictureItem.meta` (`PictureMeta`) already has the exact fields needed — confirmed by inspecting `docling_core.types.doc.document` directly, no custom annotation class required (the older `PictureItem.annotations` list is deprecated in this Docling version; use `meta`):
+
+```python
+from docling_core.types.doc.document import DescriptionMetaField, TabularChartMetaField
+from docling_core.types.doc.table_data import TableData  # exact import path to confirm when building
+
+if result.content_type in ("table", "icon_legend_table"):
+    picture.meta.tabular_chart = TabularChartMetaField(
+        title=result.title,
+        chart_data=rows_to_table_data(result.table_rows),  # maps into Docling's own TableData —
+                                                              # the SAME type TableFormer populates for
+                                                              # real tables, so downstream (chunking,
+                                                              # embedding) sees one table shape, not two
+        created_by="gemini-<model-version>",
+        confidence=result.confidence if available,
+    )
+else:
+    picture.meta.description = DescriptionMetaField(
+        text=result.extracted_text,
+        created_by="gemini-<model-version>",
+    )
+```
+
+This is what makes the extraction method/provenance row in Section 6's table true without any schema extension: `created_by` distinguishes Gemini-derived content from Docling/TableFormer-derived content (which carries Docling's own model names) by value convention alone. `picture`'s own `prov` (page number, bbox) already gives the citation link back to the source location — no new linkage mechanism needed.
+
+`doc.export_to_dict()` picks this up automatically since it's a native field, not a bolt-on — the Section 6 output contract's shape is unchanged.
+
+### 9.7 Explicitly out of scope for this pipeline
+
+- **Multi-panel reading order** (9.1's first failure class) — this pipeline does not attempt to fix it. A capable VLM reading a picture as a whole image plausibly sidesteps the problem as a side effect (it never had Docling's line-by-line OCR ordering step to begin with), but this is an unconfirmed possible bonus, not a design goal — do not build around the assumption it's fixed until observed directly on a flagged multi-panel picture.
+- **Embedding/vectorization effects of `tabular_chart` vs. `description` content** — a real open question (a table-shaped payload and a prose payload will embed differently) but belongs to the chunking/embedding design (Layer 1's next step / Layer 2), not this document. Deferred.
+- **Classification threshold tuning and Gemini schema finalization against a real corpus** — both are called out above as pre-build decisions but are inherently iterative; treat the first cut of both as a hypothesis to test against samples, not a final answer.
+
+### 9.8 Build checklist (for picking this up in a fresh session)
+
+1. Set `do_picture_classification=True`, `generate_picture_images=True` in `common.py`'s `build_converter()` (or a variant of it) and confirm `picture.meta.classification.predictions` is populated on a real sample (start with `samples/022-article-A002-en.pdf`, pictures 2 and 3 — the known 2×2 grid and icon table).
+2. Decide and hard-code an initial `flag_labels` set and `min_confidence` (9.4) — a starting guess is fine, it's meant to be revisited.
+3. Install and confirm the current Google Gemini Python SDK package name/import path; write a minimal script that sends one flagged picture crop (e.g. the page-4 icon table) and gets back structured JSON matching a first-draft schema (9.5).
+4. Write the result onto `picture.meta` per 9.6; confirm via `doc.export_to_dict()` that `created_by` and the extracted content round-trip correctly.
+5. Visual/manual check against the source image (reuse the `08_/09_` visualization pattern) before trusting this on more documents.
